@@ -4,11 +4,6 @@
 
 ---
 
-## Overview
-
-Ceramic manufacturing involves significant non-linear shrinkage during firing that varies with local geometry, wall thickness, and material density. Traditional compensation methods using uniform scaling fail to capture this complexity. MOHO_dev provides a deep learning pipeline that takes an *as-designed* 3D point cloud as input and predicts per-point shrinkage, enabling predictive compensation before forming and automated post-firing inspection.
-
----
 
 ## Method
 
