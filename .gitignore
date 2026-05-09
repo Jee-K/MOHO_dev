@@ -1,2 +1,5 @@
-./dgcnn/outputs/
-./dgcnn/part_seg_output/
+dgcnn/outputs/
+dgcnn/part_seg_output/
+dgcnn/regression_output/
+dgcnn/regression_output_0819/
+dgcnn/regression_output_0820/
