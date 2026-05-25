@@ -1,0 +1,27 @@
+name: moho
+# Create with:   conda env create -f environment.yml
+# Activate with: conda activate moho
+#
+# This default targets an NVIDIA GPU (training uses nn.DataParallel / torch.cuda).
+# To switch CUDA versions, change `pytorch-cuda` below to match your driver
+#   (e.g. 11.8 or 12.4); see https://pytorch.org for the supported matrix.
+# For a CPU-only machine, delete the `pytorch-cuda` line and the `nvidia`
+#   channel, and replace `pytorch` with `cpuonly` + `pytorch`.
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  # --- deep learning ---
+  - pytorch=2.1.*
+  - pytorch-cuda=12.1          # GPU build; remove for CPU-only (see header)
+  # --- scientific stack ---
+  - numpy
+  - scikit-learn
+  - h5py
+  # --- point cloud / IO ---
+  - pip:
+      - plyfile                # PlyData/PlyElement (main_regression.py, util.py)
+      - opencv-python          # cv2 (imported at top of data.py)

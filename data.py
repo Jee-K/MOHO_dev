@@ -322,7 +322,7 @@ def load_data_partseg_from_txt(partition, num_points=30000):
             assert pc_data.shape[1] == 4, f"{txt_path} must have 4 columns (x y z label)"
 
             coords_rgb = pc_data[:, 0:3]  # x, y, z
-            seg_labels = pc_data[:, 3].astype(np.int64)  # segmentation labels
+            seg_labels = pc_data[:, 3].astype(np.float32)  # regression target (shrinkage)
         elif pc_data.shape[1] == 3:
             assert pc_data.shape[1] == 3, f"{txt_path} must have 3 columns (x y z)"
             

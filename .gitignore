@@ -1,5 +1,7 @@
-dgcnn/outputs/
-dgcnn/part_seg_output/
-dgcnn/regression_output/
-dgcnn/regression_output_0819/
-dgcnn/regression_output_0820/
+outputs/
+part_seg_output/
+regression_output/
+regression_output_0819/
+regression_output_0820/
+__pycache__/
+*.pyc

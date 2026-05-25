@@ -16,14 +16,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
-from data import ShapeNetPart
+from data import ShapeNetPart, MOHOReg
 from model import DGCNN_partseg
-from model import DGCNN_regression
+from model import DGCNN_regression, PointNet2_regression, PointTransformer_regression
 import numpy as np
 from torch.utils.data import DataLoader
 from util import cal_loss, IOStream
 import sklearn.metrics as metrics
 from plyfile import PlyData, PlyElement
+from collections import OrderedDict
+
 
 global class_cnts
 class_indexs = np.zeros((16,), dtype=int)
@@ -148,18 +150,20 @@ def load_state_dict_with_prefix_fix(model, model_path):
     checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
     new_state_dict = OrderedDict()
     for k, v in checkpoint.items():
+        if 'conv11' in k:
+            continue
         name = k.replace('module.', '') if k.startswith('module.') else k
         new_state_dict[name] = v
     model.load_state_dict(new_state_dict, strict=False)
 
 def train(args, io):
-    train_dataset = ShapeNetPart(partition='trainval', num_points=args.num_points, class_choice=args.class_choice)
+    train_dataset = MOHOReg(partition='trainval', num_points=args.num_points, class_choice=args.class_choice)
     if (len(train_dataset) < 100):
         drop_last = False
     else:
         drop_last = True
     train_loader = DataLoader(train_dataset, num_workers=8, batch_size=args.batch_size, shuffle=True, drop_last=drop_last)
-    test_loader = DataLoader(ShapeNetPart(partition='test', num_points=args.num_points, class_choice=args.class_choice), 
+    test_loader = DataLoader(MOHOReg(partition='test', num_points=args.num_points, class_choice=args.class_choice), 
                             num_workers=8, batch_size=args.test_batch_size, shuffle=True, drop_last=False)
     
     device = torch.device("cuda" if args.cuda else "cpu")
@@ -171,27 +175,33 @@ def train(args, io):
         model = DGCNN_partseg(args, seg_num_all).to(device)
     elif args.model == 'dgcnn_regression':
         model = DGCNN_regression(args, seg_num_all).to(device)
+    elif args.model == 'pointnet2':
+        model = PointNet2_regression(args).to(device)
+    elif args.model == 'pointtransformer':
+        model = PointTransformer_regression(args).to(device)
     else:
         raise Exception("Not implemented")
     print(str(model))
 
-    if args.learnnweight == "transfer":
+    if args.learnweight == "transfer" and args.model in ('dgcnn', 'dgcnn_regression'):
         io.cprint("Transfer learning enabled")
         freeze_layers_transfer_learning(model)
 
-    if args.model_path != '':
+    if args.model_path != '' and args.model in ('dgcnn', 'dgcnn_regression'):
         load_state_dict_with_prefix_fix(model, args.model_path)
 
     model = nn.DataParallel(model)
+    if args.model == 'dgcnn_regression':
+        nn.init.kaiming_normal_(model.module.conv11.weight)
     print("Let's use", torch.cuda.device_count(), "GPUs!")
-    model.to(device)
 
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
     if args.use_sgd:
         print("Use SGD")
-        opt = optim.SGD(model.parameters(), lr=args.lr*100, momentum=args.momentum, weight_decay=1e-4)
+        opt = optim.SGD(trainable_params, lr=args.lr*100, momentum=args.momentum, weight_decay=1e-4)
     else:
         print("Use Adam")
-        opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        opt = optim.Adam(trainable_params, lr=args.lr, weight_decay=1e-4)
 
     if args.scheduler == 'cos':
         scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=1e-3)
@@ -204,119 +214,61 @@ def train(args, io):
     best_test_loss = float('inf')
     #best_test_iou = 0
     for epoch in range(args.epochs):
-        ####################
-        # Train
-        ####################
-        train_loss = 0.0
-        count = 0.0
+        # Training
         model.train()
-        #train_true_cls = []
-        #train_pred_cls = []
-        #train_true_seg = []
-        #train_pred_seg = []
-        #train_label_seg = []
+        total_train_loss, count = 0.0, 0
         for data, label, seg in train_loader:
-            seg = seg - seg_start_index
-            label_one_hot = np.zeros((label.shape[0], 16))
-            for idx in range(label.shape[0]):
-                label_one_hot[idx, label[idx]] = 1
-            label_one_hot = torch.from_numpy(label_one_hot.astype(np.float32))
-            data, label_one_hot, seg = data.to(device), label_one_hot.to(device), seg.to(device)
-            data = data.permute(0, 2, 1)
-            batch_size = data.size()[0]
+            # seg is GT regression target
+            seg = seg.float().to(device)  # [B, N]
+            data = data.permute(0, 2, 1).to(device)  # [B, C, N]
+
+            # create zero one-hot to satisfy forward()
+            label_one_hot = torch.zeros((data.size(0), 16), device=device)
+
             opt.zero_grad()
-            seg_pred = model(data, label_one_hot)
-            seg_pred = seg_pred.permute(0, 2, 1).contiguous()
-            loss = criterion(seg_pred.view(-1, seg_num_all), seg.view(-1,1).squeeze())
+            seg_pred = model(data, label_one_hot)  # [B, 1, N]
+            loss = criterion(seg_pred.squeeze(1), seg)  # both [B, N]
             loss.backward()
             opt.step()
-            #pred = seg_pred.max(dim=2)[1]               # (batch_size, num_points)
-            count += batch_size
-            train_loss += loss.item() * batch_size
-            seg_np = seg.cpu().numpy()                  # (batch_size, num_points)
-            pred_np = pred.detach().cpu().numpy()       # (batch_size, num_points)
-            train_true_cls.append(seg_np.reshape(-1))       # (batch_size * num_points)
-            train_pred_cls.append(pred_np.reshape(-1))      # (batch_size * num_points)
-            train_true_seg.append(seg_np)
-            train_pred_seg.append(pred_np)
-            train_label_seg.append(label.reshape(-1))
+
+            total_train_loss += loss.item() * data.size(0)
+            count += data.size(0)
+
         if args.scheduler == 'cos':
             scheduler.step()
-        elif args.scheduler == 'step':
-            if opt.param_groups[0]['lr'] > 1e-5:
-                scheduler.step()
-            if opt.param_groups[0]['lr'] < 1e-5:
-                for param_group in opt.param_groups:
-                    param_group['lr'] = 1e-5
-        train_true_cls = np.concatenate(train_true_cls)
-        train_pred_cls = np.concatenate(train_pred_cls)
-        train_acc = metrics.accuracy_score(train_true_cls, train_pred_cls)
-        avg_per_class_acc = metrics.balanced_accuracy_score(train_true_cls, train_pred_cls)
-        train_true_seg = np.concatenate(train_true_seg, axis=0)
-        train_pred_seg = np.concatenate(train_pred_seg, axis=0)
-        train_label_seg = np.concatenate(train_label_seg)
-        train_ious = calculate_shape_IoU(train_pred_seg, train_true_seg, train_label_seg, args.class_choice)
-        outstr = 'Train %d, loss: %.6f, train acc: %.6f, train avg acc: %.6f, train iou: %.6f' % (epoch, 
-                                                                                                  train_loss*1.0/count,
-                                                                                                  train_acc,
-                                                                                                  avg_per_class_acc,
-                                                                                                  np.mean(train_ious))
-        io.cprint(outstr)
+        elif args.scheduler == 'step' and opt.param_groups[0]['lr'] > 1e-5:
+            scheduler.step()
 
-        ####################
-        # Test
-        ####################
-        test_loss = 0.0
-        count = 0.0
+        avg_train_loss = total_train_loss / count
+        io.cprint(f"Epoch {epoch} Train Loss: {avg_train_loss:.6f}")
+
+        # Validation
         model.eval()
-        test_true_cls = []
-        test_pred_cls = []
-        test_true_seg = []
-        test_pred_seg = []
-        test_label_seg = []
-        for data, label, seg in test_loader:
-            seg = seg - seg_start_index
-            label_one_hot = np.zeros((label.shape[0], 16))
-            for idx in range(label.shape[0]):
-                label_one_hot[idx, label[idx]] = 1
-            label_one_hot = torch.from_numpy(label_one_hot.astype(np.float32))
-            data, label_one_hot, seg = data.to(device), label_one_hot.to(device), seg.to(device)
-            data = data.permute(0, 2, 1)
-            batch_size = data.size()[0]
-            seg_pred = model(data, label_one_hot)
-            seg_pred = seg_pred.permute(0, 2, 1).contiguous()
-            loss = criterion(seg_pred.view(-1, seg_num_all), seg.view(-1,1).squeeze())
-            pred = seg_pred.max(dim=2)[1]
-            count += batch_size
-            test_loss += loss.item() * batch_size
-            seg_np = seg.cpu().numpy()
-            pred_np = pred.detach().cpu().numpy()
-            test_true_cls.append(seg_np.reshape(-1))
-            test_pred_cls.append(pred_np.reshape(-1))
-            test_true_seg.append(seg_np)
-            test_pred_seg.append(pred_np)
-            test_label_seg.append(label.reshape(-1))
-        test_true_cls = np.concatenate(test_true_cls)
-        test_pred_cls = np.concatenate(test_pred_cls)
-        test_acc = metrics.accuracy_score(test_true_cls, test_pred_cls)
-        avg_per_class_acc = metrics.balanced_accuracy_score(test_true_cls, test_pred_cls)
-        test_true_seg = np.concatenate(test_true_seg, axis=0)
-        test_pred_seg = np.concatenate(test_pred_seg, axis=0)
-        test_label_seg = np.concatenate(test_label_seg)
-        test_ious = calculate_shape_IoU(test_pred_seg, test_true_seg, test_label_seg, args.class_choice)
-        outstr = 'Test %d, loss: %.6f, test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (epoch,
-                                                                                              test_loss*1.0/count,
-                                                                                              test_acc,
-                                                                                              avg_per_class_acc,
-                                                                                              np.mean(test_ious))
-        io.cprint(outstr)
-        if np.mean(test_ious) >= best_test_iou:
-            best_test_iou = np.mean(test_ious)
-            torch.save(model.state_dict(), 'outputs/%s/models/model.t7' % args.exp_name)
+        total_test_loss, test_count = 0.0, 0
+        with torch.no_grad():
+            for data, label, seg in test_loader:
+                seg = seg.float().to(device)
+                data = data.permute(0, 2, 1).to(device)
+                label_one_hot = torch.zeros((data.size(0), 16), device=device)
 
+                seg_pred = model(data, label_one_hot)
+                loss = criterion(seg_pred.squeeze(1), seg)
+
+                total_test_loss += loss.item() * data.size(0)
+                test_count += data.size(0)
+
+        avg_test_loss = total_test_loss / test_count
+        io.cprint(f"Epoch {epoch} Test Loss: {avg_test_loss:.6f}")
+
+        if avg_test_loss < best_test_loss:
+            best_test_loss = avg_test_loss
+            save_path = f'outputs/{args.exp_name}/models/model.t7'
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            torch.save(model.state_dict(), save_path)
+            io.cprint(f"Saved best model to {save_path}")
 
 def test(args, io):
-    test_loader = DataLoader(ShapeNetPart(partition='test', num_points=args.num_points, class_choice=args.class_choice),
+    test_loader = DataLoader(MOHOReg(partition='test', num_points=args.num_points, class_choice=args.class_choice),
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
     device = torch.device("cuda" if args.cuda else "cpu")
     
@@ -328,54 +280,31 @@ def test(args, io):
         model = DGCNN_partseg(args, seg_num_all).to(device)
     elif args.model == 'dgcnn_regression':
         model = DGCNN_regression(args, seg_num_all).to(device)
+    elif args.model == 'pointnet2':
+        model = PointNet2_regression(args).to(device)
+    elif args.model == 'pointtransformer':
+        model = PointTransformer_regression(args).to(device)
     else:
         raise Exception("Not implemented")
 
     model = nn.DataParallel(model)
     model.load_state_dict(torch.load(args.model_path))
     model = model.eval()
-    test_acc = 0.0
-    count = 0.0
-    test_true_cls = []
-    test_pred_cls = []
-    test_true_seg = []
-    test_pred_seg = []
-    test_label_seg = []
-    for data, label, seg in test_loader:
-        seg = seg - seg_start_index
-        label_one_hot = np.zeros((label.shape[0], 16))
-        for idx in range(label.shape[0]):
-            label_one_hot[idx, label[idx]] = 1
-        label_one_hot = torch.from_numpy(label_one_hot.astype(np.float32))
-        data, label_one_hot, seg = data.to(device), label_one_hot.to(device), seg.to(device)
-        data = data.permute(0, 2, 1)
-        batch_size = data.size()[0]
-        seg_pred = model(data, label_one_hot)
-        seg_pred = seg_pred.permute(0, 2, 1).contiguous()
-        pred = seg_pred.max(dim=2)[1]
-        seg_np = seg.cpu().numpy()
-        pred_np = pred.detach().cpu().numpy()
-        test_true_cls.append(seg_np.reshape(-1))
-        test_pred_cls.append(pred_np.reshape(-1))
-        test_true_seg.append(seg_np)
-        test_pred_seg.append(pred_np)
-        test_label_seg.append(label.reshape(-1))
-        # visiualization
-        visualization(args.visu, args.visu_format, data, pred, seg, label, partseg_colors, args.class_choice) 
-    if visual_warning and args.visu != '':
-        print('Visualization Failed: You can only choose a point cloud shape to visualize within the scope of the test class')
-    test_true_cls = np.concatenate(test_true_cls)
-    test_pred_cls = np.concatenate(test_pred_cls)
-    test_acc = metrics.accuracy_score(test_true_cls, test_pred_cls)
-    avg_per_class_acc = metrics.balanced_accuracy_score(test_true_cls, test_pred_cls)
-    test_true_seg = np.concatenate(test_true_seg, axis=0)
-    test_pred_seg = np.concatenate(test_pred_seg, axis=0)
-    test_label_seg = np.concatenate(test_label_seg)
-    test_ious = calculate_shape_IoU(test_pred_seg, test_true_seg, test_label_seg, args.class_choice)
-    outstr = 'Test :: test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (test_acc,
-                                                                             avg_per_class_acc,
-                                                                             np.mean(test_ious))
-    io.cprint(outstr)
+    criterion = nn.MSELoss()
+    total_loss, count = 0.0, 0
+    with torch.no_grad():
+        for data, label, seg in test_loader:
+            seg = seg.float().to(device)
+            data = data.permute(0, 2, 1).to(device)
+            label_one_hot = torch.zeros((data.size(0), 16), device=device)
+
+            seg_pred = model(data, label_one_hot)
+            loss = criterion(seg_pred.squeeze(1), seg)
+
+            total_loss += loss.item() * data.size(0)
+            count += data.size(0)
+
+    io.cprint(f"Test Regression Loss: {total_loss / count:.6f}")
 
 
 if __name__ == "__main__":
@@ -383,9 +312,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Point Cloud Part Segmentation')
     parser.add_argument('--exp_name', type=str, default='exp', metavar='N',
                         help='Name of the experiment')
-    parser.add_argument('--model', type=str, default='dgcnn', metavar='N',
-                        choices=['dgcnn'],
-                        help='Model to use, [dgcnn]')
+    parser.add_argument('--model', type=str, default='dgcnn_regression', metavar='N',
+                        choices=['dgcnn', 'dgcnn_regression', 'pointnet2', 'pointtransformer'],
+                        help='Model to use: dgcnn_regression | pointnet2 | pointtransformer')
     parser.add_argument('--dataset', type=str, default='shapenetpart', metavar='N',
                         choices=['shapenetpart'])
     parser.add_argument('--class_choice', type=str, default=None, metavar='N',
@@ -413,7 +342,7 @@ if __name__ == "__main__":
                         help='random seed (default: 1)')
     parser.add_argument('--eval', type=bool,  default=False,
                         help='evaluate the model')
-    parser.add_argument('--num_points', type=int, default=2048,
+    parser.add_argument('--num_points', type=int, default=4096,
                         help='num of points to use')
     parser.add_argument('--dropout', type=float, default=0.5,
                         help='dropout rate')
@@ -427,6 +356,7 @@ if __name__ == "__main__":
                         help='visualize the model')
     parser.add_argument('--visu_format', type=str, default='ply',
                         help='file format of visualization')
+    parser.add_argument('--learnweight', type=str, default='', choices=['', 'transfer'])
     args = parser.parse_args()
 
     _init_()
